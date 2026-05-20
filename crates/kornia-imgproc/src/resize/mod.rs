@@ -249,6 +249,103 @@ pub fn resize_fast_u8_aa<const C: usize, A1: ImageAllocator, A2: ImageAllocator>
     resize_fast_impl(src, dst, interpolation, antialias)
 }
 
+/// Resize a UYVY (packed 4:2:2) image to a new size.
+///
+/// UYVY is a packed YUV 4:2:2 format where each 4-byte macropixel encodes
+/// 2 horizontal pixels as [U, Y0, V, Y1]. Chroma (U/V) is horizontally
+/// subsampled 2:1 relative to luma (Y).
+///
+/// The function unpacks the image into separate Y, U, V planes, resizes each
+/// independently using the specified interpolation mode, then repacks into UYVY.
+/// This preserves correct chroma subsampling across the resize.
+///
+/// # Arguments
+///
+/// * `src` - Input UYVY image. Width must be even.
+/// * `dst` - Output UYVY image. Width must be even.
+/// * `interpolation` - Interpolation mode. Bilinear is recommended for speed;
+///   Bicubic or Lanczos for highest quality.
+///
+/// # Errors
+///
+/// Returns [`ImageError::InvalidImageSize`] if either width is odd.
+pub fn resize_fast_uyvy<A1: ImageAllocator, A2: ImageAllocator>(
+    src: &Image<u8, 2, A1>,
+    dst: &mut Image<u8, 2, A2>,
+    interpolation: InterpolationMode,
+) -> Result<(), ImageError> {
+    let src_w = src.cols();
+    let src_h = src.rows();
+    let dst_w = dst.cols();
+    let dst_h = dst.rows();
+
+    if src_w % 2 != 0 || dst_w % 2 != 0 {
+        return Err(ImageError::InvalidImageSize(src_w, src_h, dst_w, dst_h));
+    }
+
+    let src_chroma_w = src_w / 2;
+    let dst_chroma_w = dst_w / 2;
+
+    // --- Unpack UYVY → planar Y, U, V ---
+    let src_slice = src.as_slice();
+    let mut y_plane = vec![0u8; src_w * src_h];
+    let mut u_plane = vec![0u8; src_chroma_w * src_h];
+    let mut v_plane = vec![0u8; src_chroma_w * src_h];
+
+    for row in 0..src_h {
+        for col in 0..src_chroma_w {
+            // Each macropixel is 4 bytes: [U, Y0, V, Y1]
+            let i = row * src_w * 2 + col * 4;
+            u_plane[row * src_chroma_w + col]  = src_slice[i];
+            y_plane[row * src_w + col * 2]     = src_slice[i + 1];
+            v_plane[row * src_chroma_w + col]  = src_slice[i + 2];
+            y_plane[row * src_w + col * 2 + 1] = src_slice[i + 3];
+        }
+    }
+
+    // --- Resize each plane independently ---
+    let mut y_dst = vec![0u8; dst_w * dst_h];
+    let mut u_dst = vec![0u8; dst_chroma_w * dst_h];
+    let mut v_dst = vec![0u8; dst_chroma_w * dst_h];
+
+    match interpolation {
+        InterpolationMode::Nearest => {
+            nearest::resize_nearest_u8::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h);
+            nearest::resize_nearest_u8::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h);
+            nearest::resize_nearest_u8::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h);
+        }
+        InterpolationMode::Bilinear => {
+            bilinear::resize_bilinear_u8_nch::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h);
+            bilinear::resize_bilinear_u8_nch::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h);
+            bilinear::resize_bilinear_u8_nch::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h);
+        }
+        InterpolationMode::Bicubic => {
+            separable::resize_separable_u8::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h, FilterKind::Cubic,    true);
+            separable::resize_separable_u8::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h, FilterKind::Cubic,    true);
+            separable::resize_separable_u8::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h, FilterKind::Cubic,    true);
+        }
+        InterpolationMode::Lanczos => {
+            separable::resize_separable_u8::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h, FilterKind::Lanczos3, true);
+            separable::resize_separable_u8::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h, FilterKind::Lanczos3, true);
+            separable::resize_separable_u8::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h, FilterKind::Lanczos3, true);
+        }
+    }
+
+    // --- Repack planar Y, U, V → UYVY ---
+    let dst_slice = dst.as_slice_mut();
+    for row in 0..dst_h {
+        for col in 0..dst_chroma_w {
+            let i = row * dst_w * 2 + col * 4;
+            dst_slice[i]     = u_dst[row * dst_chroma_w + col];
+            dst_slice[i + 1] = y_dst[row * dst_w + col * 2];
+            dst_slice[i + 2] = v_dst[row * dst_chroma_w + col];
+            dst_slice[i + 3] = y_dst[row * dst_w + col * 2 + 1];
+        }
+    }
+
+    Ok(())
+}
+
 /// Resize a 1-channel u8 image. Convenience wrapper around [`resize_fast_u8`].
 pub fn resize_fast_mono<A1: ImageAllocator, A2: ImageAllocator>(
     src: &Image<u8, 1, A1>,
@@ -544,6 +641,167 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resize_fast_uyvy_bilinear() -> Result<(), ImageError> {
+        let src_w = 4;
+        let src_h = 4;
+        let macropixel = [10u8, 100, 20, 110, 30, 120, 40, 130];
+        let data: Vec<u8> = macropixel
+            .iter()
+            .cloned()
+            .cycle()
+            .take(src_w * src_h * 2)
+            .collect();
+
+        let image = Image::<u8, 2, _>::new(
+            ImageSize { width: src_w, height: src_h },
+            data,
+            CpuAllocator,
+        )?;
+
+        let mut dst = Image::<u8, 2, _>::from_size_val(
+            ImageSize { width: 2, height: 2 },
+            0,
+            CpuAllocator,
+        )?;
+
+        super::resize_fast_uyvy(&image, &mut dst, super::InterpolationMode::Bilinear)?;
+
+        assert_eq!(dst.num_channels(), 2);
+        assert_eq!(dst.size().width, 2);
+        assert_eq!(dst.size().height, 2);
+        assert!(dst.as_slice().iter().any(|&b| b != 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resize_fast_uyvy_nearest() -> Result<(), ImageError> {
+        let src_w = 4;
+        let src_h = 4;
+        let macropixel = [10u8, 100, 20, 110, 30, 120, 40, 130];
+        let data: Vec<u8> = macropixel
+            .iter()
+            .cloned()
+            .cycle()
+            .take(src_w * src_h * 2)
+            .collect();
+
+        let image = Image::<u8, 2, _>::new(
+            ImageSize { width: src_w, height: src_h },
+            data,
+            CpuAllocator,
+        )?;
+
+        let mut dst = Image::<u8, 2, _>::from_size_val(
+            ImageSize { width: 2, height: 2 },
+            0,
+            CpuAllocator,
+        )?;
+
+        super::resize_fast_uyvy(&image, &mut dst, super::InterpolationMode::Nearest)?;
+
+        assert_eq!(dst.num_channels(), 2);
+        assert_eq!(dst.size().width, 2);
+        assert_eq!(dst.size().height, 2);
+        assert!(dst.as_slice().iter().any(|&b| b != 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resize_fast_uyvy_bicubic() -> Result<(), ImageError> {
+        let src_w = 4;
+        let src_h = 4;
+        let macropixel = [10u8, 100, 20, 110, 30, 120, 40, 130];
+        let data: Vec<u8> = macropixel
+            .iter()
+            .cloned()
+            .cycle()
+            .take(src_w * src_h * 2)
+            .collect();
+
+        let image = Image::<u8, 2, _>::new(
+            ImageSize { width: src_w, height: src_h },
+            data,
+            CpuAllocator,
+        )?;
+
+        let mut dst = Image::<u8, 2, _>::from_size_val(
+            ImageSize { width: 2, height: 2 },
+            0,
+            CpuAllocator,
+        )?;
+
+        super::resize_fast_uyvy(&image, &mut dst, super::InterpolationMode::Bicubic)?;
+
+        assert_eq!(dst.num_channels(), 2);
+        assert_eq!(dst.size().width, 2);
+        assert_eq!(dst.size().height, 2);
+        assert!(dst.as_slice().iter().any(|&b| b != 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resize_fast_uyvy_lanczos() -> Result<(), ImageError> {
+        let src_w = 4;
+        let src_h = 4;
+        let macropixel = [10u8, 100, 20, 110, 30, 120, 40, 130];
+        let data: Vec<u8> = macropixel
+            .iter()
+            .cloned()
+            .cycle()
+            .take(src_w * src_h * 2)
+            .collect();
+
+        let image = Image::<u8, 2, _>::new(
+            ImageSize { width: src_w, height: src_h },
+            data,
+            CpuAllocator,
+        )?;
+
+        let mut dst = Image::<u8, 2, _>::from_size_val(
+            ImageSize { width: 2, height: 2 },
+            0,
+            CpuAllocator,
+        )?;
+
+        super::resize_fast_uyvy(&image, &mut dst, super::InterpolationMode::Lanczos)?;
+
+        assert_eq!(dst.num_channels(), 2);
+        assert_eq!(dst.size().width, 2);
+        assert_eq!(dst.size().height, 2);
+        assert!(dst.as_slice().iter().any(|&b| b != 0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resize_fast_uyvy_odd_width_rejected() -> Result<(), ImageError> {
+        let result = Image::<u8, 2, _>::new(
+            ImageSize { width: 3, height: 2 },
+            vec![0u8; 3 * 2 * 2],
+            CpuAllocator,
+        );
+
+        match result {
+            Err(_) => {}
+            Ok(image) => {
+                let mut dst = Image::<u8, 2, _>::from_size_val(
+                    ImageSize { width: 2, height: 2 },
+                    0,
+                    CpuAllocator,
+                )?;
+                assert!(super::resize_fast_uyvy(
+                    &image, &mut dst, super::InterpolationMode::Bilinear
+                ).is_err());
+            }
+        }
+
         Ok(())
     }
 }
