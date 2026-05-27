@@ -181,7 +181,7 @@ fn bench_resize_uyvy(c: &mut Criterion) {
         ).unwrap();
         let uyvy_dst = Image::<u8, 2, _>::from_size_val(new_size, 0, CpuAllocator).unwrap();
 
-        // Baseline: convert UYVY→RGB, then resize RGB
+        // Baseline: resize RGB (no UYVY→RGB conversion cost, making this conservative)
         let rgb_data = vec![0u8; width * height * 3];
         let rgb = Image::<u8, 3, _>::new(
             [*width, *height].into(),
@@ -207,11 +207,28 @@ fn bench_resize_uyvy(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("resize_fast_uyvy", &parameter_string),
-            &(uyvy, uyvy_dst),
+            &(uyvy.clone(), uyvy_dst.clone()),
             |b, i| {
                 let (src, mut dst) = (i.0.clone(), i.1.clone());
                 b.iter(|| {
                     resize::resize_fast_uyvy(
+                        std::hint::black_box(&src),
+                        std::hint::black_box(&mut dst),
+                        std::hint::black_box(InterpolationMode::Bilinear),
+                    )
+                })
+            },
+        );
+
+        // UyvyResizer: pre-allocated scratch buffers, zero per-frame allocation
+        let mut resizer = resize::UyvyResizer::new(*width, *height, width / 2, height / 2).unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("uyvy_resizer", &parameter_string),
+            &(uyvy, uyvy_dst),
+            |b, i| {
+                let (src, mut dst) = (i.0.clone(), i.1.clone());
+                b.iter(|| {
+                    resizer.resize(
                         std::hint::black_box(&src),
                         std::hint::black_box(&mut dst),
                         std::hint::black_box(InterpolationMode::Bilinear),
