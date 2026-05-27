@@ -262,6 +262,130 @@ pub fn resize_fast_u8_aa<const C: usize, A1: ImageAllocator, A2: ImageAllocator>
 /// NEON (aarch64) or AVX2 (x86_64) SIMD paths where available, falling back
 /// to a scalar implementation otherwise.
 ///
+/// Scratch buffers are pre-allocated at construction time and reused across
+/// calls, avoiding per-frame heap allocation.
+///
+/// # Arguments
+///
+/// * `src` - Input UYVY image. Width must be even.
+/// * `dst` - Output UYVY image. Width must be even.
+/// * `interpolation` - Interpolation mode. Bilinear is recommended for speed;
+///   Bicubic or Lanczos for highest quality.
+///
+/// # Errors
+///
+/// Returns [`ImageError::InvalidImageSize`] if either width is odd, or if
+/// the image dimensions do not match those provided at construction.
+pub struct UyvyResizer {
+    y_plane: Vec<u8>,
+    u_plane: Vec<u8>,
+    v_plane: Vec<u8>,
+    y_dst:   Vec<u8>,
+    u_dst:   Vec<u8>,
+    v_dst:   Vec<u8>,
+    src_w:   usize,
+    src_h:   usize,
+    dst_w:   usize,
+    dst_h:   usize,
+}
+
+impl UyvyResizer {
+    /// Allocate scratch buffers for resizing a UYVY image from `src_w×src_h`
+    /// to `dst_w×dst_h`. Both widths must be even.
+    pub fn new(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Result<Self, ImageError> {
+        if src_w % 2 != 0 || dst_w % 2 != 0 {
+            return Err(ImageError::InvalidImageSize(src_w, src_h, dst_w, dst_h));
+        }
+        let src_chroma_w = src_w / 2;
+        let dst_chroma_w = dst_w / 2;
+        Ok(Self {
+            y_plane: vec![0u8; src_w * src_h],
+            u_plane: vec![0u8; src_chroma_w * src_h],
+            v_plane: vec![0u8; src_chroma_w * src_h],
+            y_dst:   vec![0u8; dst_w * dst_h],
+            u_dst:   vec![0u8; dst_chroma_w * dst_h],
+            v_dst:   vec![0u8; dst_chroma_w * dst_h],
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+        })
+    }
+
+    /// Resize `src` into `dst` using pre-allocated scratch buffers.
+    pub fn resize<A1: ImageAllocator, A2: ImageAllocator>(
+        &mut self,
+        src: &Image<u8, 2, A1>,
+        dst: &mut Image<u8, 2, A2>,
+        interpolation: InterpolationMode,
+    ) -> Result<(), ImageError> {
+        if src.cols() != self.src_w || src.rows() != self.src_h {
+            return Err(ImageError::InvalidImageSize(src.cols(), src.rows(), self.src_w, self.src_h));
+        }
+        if dst.cols() != self.dst_w || dst.rows() != self.dst_h {
+            return Err(ImageError::InvalidImageSize(dst.cols(), dst.rows(), self.dst_w, self.dst_h));
+        }
+
+        let src_chroma_w = self.src_w / 2;
+        let dst_chroma_w = self.dst_w / 2;
+
+        // --- Unpack UYVY → planar Y, U, V ---
+        for row in 0..self.src_h {
+            let src_row = &src.as_slice()[row * self.src_w * 2..(row + 1) * self.src_w * 2];
+            let y_row   = &mut self.y_plane[row * self.src_w..][..self.src_w];
+            let u_row   = &mut self.u_plane[row * src_chroma_w..][..src_chroma_w];
+            let v_row   = &mut self.v_plane[row * src_chroma_w..][..src_chroma_w];
+            kernels::unpack_uyvy_row(src_row, y_row, u_row, v_row, src_chroma_w);
+        }
+
+        // --- Resize each plane independently ---
+        match interpolation {
+            InterpolationMode::Nearest => {
+                nearest::resize_nearest_u8::<1>(&self.y_plane, self.src_w,  self.src_h, &mut self.y_dst, self.dst_w,  self.dst_h);
+                nearest::resize_nearest_u8::<1>(&self.u_plane, src_chroma_w, self.src_h, &mut self.u_dst, dst_chroma_w, self.dst_h);
+                nearest::resize_nearest_u8::<1>(&self.v_plane, src_chroma_w, self.src_h, &mut self.v_dst, dst_chroma_w, self.dst_h);
+            }
+            InterpolationMode::Bilinear => {
+                bilinear::resize_bilinear_u8_nch::<1>(&self.y_plane, self.src_w,  self.src_h, &mut self.y_dst, self.dst_w,  self.dst_h);
+                bilinear::resize_bilinear_u8_nch::<1>(&self.u_plane, src_chroma_w, self.src_h, &mut self.u_dst, dst_chroma_w, self.dst_h);
+                bilinear::resize_bilinear_u8_nch::<1>(&self.v_plane, src_chroma_w, self.src_h, &mut self.v_dst, dst_chroma_w, self.dst_h);
+            }
+            InterpolationMode::Bicubic => {
+                separable::resize_separable_u8::<1>(&self.y_plane, self.src_w,  self.src_h, &mut self.y_dst, self.dst_w,  self.dst_h, FilterKind::Cubic, true);
+                separable::resize_separable_u8::<1>(&self.u_plane, src_chroma_w, self.src_h, &mut self.u_dst, dst_chroma_w, self.dst_h, FilterKind::Cubic, true);
+                separable::resize_separable_u8::<1>(&self.v_plane, src_chroma_w, self.src_h, &mut self.v_dst, dst_chroma_w, self.dst_h, FilterKind::Cubic, true);
+            }
+            InterpolationMode::Lanczos => {
+                separable::resize_separable_u8::<1>(&self.y_plane, self.src_w,  self.src_h, &mut self.y_dst, self.dst_w,  self.dst_h, FilterKind::Lanczos3, true);
+                separable::resize_separable_u8::<1>(&self.u_plane, src_chroma_w, self.src_h, &mut self.u_dst, dst_chroma_w, self.dst_h, FilterKind::Lanczos3, true);
+                separable::resize_separable_u8::<1>(&self.v_plane, src_chroma_w, self.src_h, &mut self.v_dst, dst_chroma_w, self.dst_h, FilterKind::Lanczos3, true);
+            }
+        }
+
+        // --- Repack planar Y, U, V → UYVY ---
+        for row in 0..self.dst_h {
+            let y_row   = &self.y_dst[row * self.dst_w..][..self.dst_w];
+            let u_row   = &self.u_dst[row * dst_chroma_w..][..dst_chroma_w];
+            let v_row   = &self.v_dst[row * dst_chroma_w..][..dst_chroma_w];
+            let dst_row = &mut dst.as_slice_mut()[row * self.dst_w * 2..][..self.dst_w * 2];
+            kernels::repack_uyvy_row(y_row, u_row, v_row, dst_row, dst_chroma_w);
+        }
+
+        Ok(())
+    }
+}
+
+/// Resize a UYVY (packed 4:2:2) image to a new size.
+///
+/// UYVY is a packed YUV 4:2:2 format where each 4-byte macropixel encodes
+/// 2 horizontal pixels as [U, Y0, V, Y1]. Chroma (U/V) is horizontally
+/// subsampled 2:1 relative to luma (Y).
+///
+/// This is a convenience wrapper around [`UyvyResizer`] for one-off resizes.
+/// It allocates scratch buffers on every call — if you are resizing frames in
+/// a loop (e.g. a camera capture pipeline), prefer [`UyvyResizer`] directly to
+/// avoid per-frame heap allocation.
+///
 /// # Arguments
 ///
 /// * `src` - Input UYVY image. Width must be even.
@@ -277,70 +401,10 @@ pub fn resize_fast_uyvy<A1: ImageAllocator, A2: ImageAllocator>(
     dst: &mut Image<u8, 2, A2>,
     interpolation: InterpolationMode,
 ) -> Result<(), ImageError> {
-    let src_w = src.cols();
-    let src_h = src.rows();
-    let dst_w = dst.cols();
-    let dst_h = dst.rows();
-
-    if src_w % 2 != 0 || dst_w % 2 != 0 {
-        return Err(ImageError::InvalidImageSize(src_w, src_h, dst_w, dst_h));
-    }
-
-    let src_chroma_w = src_w / 2;
-    let dst_chroma_w = dst_w / 2;
-
-    // --- Unpack UYVY → planar Y, U, V ---
-    let mut y_plane = vec![0u8; src_w * src_h];
-    let mut u_plane = vec![0u8; src_chroma_w * src_h];
-    let mut v_plane = vec![0u8; src_chroma_w * src_h];
-
-    for row in 0..src_h {
-        let src_row = &src.as_slice()[row * src_w * 2..(row + 1) * src_w * 2];
-        let y_row   = &mut y_plane[row * src_w..][..src_w];
-        let u_row   = &mut u_plane[row * src_chroma_w..][..src_chroma_w];
-        let v_row   = &mut v_plane[row * src_chroma_w..][..src_chroma_w];
-        kernels::unpack_uyvy_row(src_row, y_row, u_row, v_row, src_chroma_w);
-    }
-
-    // --- Resize each plane independently ---
-    let mut y_dst = vec![0u8; dst_w * dst_h];
-    let mut u_dst = vec![0u8; dst_chroma_w * dst_h];
-    let mut v_dst = vec![0u8; dst_chroma_w * dst_h];
-
-    match interpolation {
-        InterpolationMode::Nearest => {
-            nearest::resize_nearest_u8::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h);
-            nearest::resize_nearest_u8::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h);
-            nearest::resize_nearest_u8::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h);
-        }
-        InterpolationMode::Bilinear => {
-            bilinear::resize_bilinear_u8_nch::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h);
-            bilinear::resize_bilinear_u8_nch::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h);
-            bilinear::resize_bilinear_u8_nch::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h);
-        }
-        InterpolationMode::Bicubic => {
-            separable::resize_separable_u8::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h, FilterKind::Cubic,    true);
-            separable::resize_separable_u8::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h, FilterKind::Cubic,    true);
-            separable::resize_separable_u8::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h, FilterKind::Cubic,    true);
-        }
-        InterpolationMode::Lanczos => {
-            separable::resize_separable_u8::<1>(&y_plane, src_w,        src_h, &mut y_dst, dst_w,        dst_h, FilterKind::Lanczos3, true);
-            separable::resize_separable_u8::<1>(&u_plane, src_chroma_w, src_h, &mut u_dst, dst_chroma_w, dst_h, FilterKind::Lanczos3, true);
-            separable::resize_separable_u8::<1>(&v_plane, src_chroma_w, src_h, &mut v_dst, dst_chroma_w, dst_h, FilterKind::Lanczos3, true);
-        }
-    }
-
-    // --- Repack planar Y, U, V → UYVY ---
-    for row in 0..dst_h {
-        let y_row   = &y_dst[row * dst_w..][..dst_w];
-        let u_row   = &u_dst[row * dst_chroma_w..][..dst_chroma_w];
-        let v_row   = &v_dst[row * dst_chroma_w..][..dst_chroma_w];
-        let dst_row = &mut dst.as_slice_mut()[row * dst_w * 2..][..dst_w * 2];
-        kernels::repack_uyvy_row(y_row, u_row, v_row, dst_row, dst_chroma_w);
-    }
-
-    Ok(())
+    UyvyResizer::new(src.cols(), src.rows(), dst.cols(), dst.rows())?
+        .resize(src, dst, interpolation)
 }
+
 
 /// Resize a 1-channel u8 image. Convenience wrapper around [`resize_fast_u8`].
 pub fn resize_fast_mono<A1: ImageAllocator, A2: ImageAllocator>(
@@ -438,6 +502,7 @@ fn resize_fast_impl<const C: usize, A1: ImageAllocator, A2: ImageAllocator>(
 mod tests {
     use kornia_image::{Image, ImageError, ImageSize};
     use kornia_tensor::{CpuAllocator, TensorError};
+    use crate::resize::{InterpolationMode, UyvyResizer};
 
     #[test]
     fn resize_smoke_ch3() -> Result<(), ImageError> {
@@ -797,6 +862,36 @@ mod tests {
                 ).is_err());
             }
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn uyvy_resizer_reuses_allocation() -> Result<(), ImageError> {
+        let src_w = 32;
+        let src_h = 4;
+        let dst_w = 16;
+        let dst_h = 2;
+        let data: Vec<u8> = (0..src_w * src_h * 2).map(|i| (i % 251) as u8).collect();
+
+        let src = Image::<u8, 2, _>::new(
+            ImageSize { width: src_w, height: src_h },
+            data,
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<u8, 2, _>::from_size_val(
+            ImageSize { width: dst_w, height: dst_h },
+            0,
+            CpuAllocator,
+        )?;
+
+        let mut resizer = UyvyResizer::new(src_w, src_h, dst_w, dst_h)?;
+
+        // Call twice to verify reuse doesn't corrupt output
+        resizer.resize(&src, &mut dst, InterpolationMode::Bilinear)?;
+        let first = dst.as_slice().to_vec();
+        resizer.resize(&src, &mut dst, InterpolationMode::Bilinear)?;
+        assert_eq!(first, dst.as_slice(), "second call produced different output");
 
         Ok(())
     }
