@@ -161,5 +161,68 @@ fn bench_resize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_resize);
+fn bench_resize_uyvy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ResizeUyvy");
+
+    for (width, height) in [(1920, 1080), (3840, 2160)].iter() {
+        group.throughput(criterion::Throughput::Elements((*width * *height) as u64));
+
+        let parameter_string = format!("{width}x{height}");
+        let new_size = ImageSize {
+            width: width / 2,
+            height: height / 2,
+        };
+
+        let uyvy_data = vec![0u8; width * height * 2];
+        let uyvy = Image::<u8, 2, _>::new(
+            [*width, *height].into(),
+            uyvy_data,
+            CpuAllocator,
+        ).unwrap();
+        let uyvy_dst = Image::<u8, 2, _>::from_size_val(new_size, 0, CpuAllocator).unwrap();
+
+        // Baseline: convert UYVY→RGB, then resize RGB
+        let rgb_data = vec![0u8; width * height * 3];
+        let rgb = Image::<u8, 3, _>::new(
+            [*width, *height].into(),
+            rgb_data,
+            CpuAllocator,
+        ).unwrap();
+        let rgb_dst = Image::<u8, 3, _>::from_size_val(new_size, 0, CpuAllocator).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::new("rgb_resize_baseline", &parameter_string),
+            &(rgb, rgb_dst),
+            |b, i| {
+                let (src, mut dst) = (i.0.clone(), i.1.clone());
+                b.iter(|| {
+                    resize::resize_fast_rgb(
+                        std::hint::black_box(&src),
+                        std::hint::black_box(&mut dst),
+                        std::hint::black_box(InterpolationMode::Bilinear),
+                    )
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("resize_fast_uyvy", &parameter_string),
+            &(uyvy, uyvy_dst),
+            |b, i| {
+                let (src, mut dst) = (i.0.clone(), i.1.clone());
+                b.iter(|| {
+                    resize::resize_fast_uyvy(
+                        std::hint::black_box(&src),
+                        std::hint::black_box(&mut dst),
+                        std::hint::black_box(InterpolationMode::Bilinear),
+                    )
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_resize, bench_resize_uyvy);
 criterion_main!(benches);

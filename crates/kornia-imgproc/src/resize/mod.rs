@@ -255,9 +255,12 @@ pub fn resize_fast_u8_aa<const C: usize, A1: ImageAllocator, A2: ImageAllocator>
 /// 2 horizontal pixels as [U, Y0, V, Y1]. Chroma (U/V) is horizontally
 /// subsampled 2:1 relative to luma (Y).
 ///
-/// The function unpacks the image into separate Y, U, V planes, resizes each
-/// independently using the specified interpolation mode, then repacks into UYVY.
-/// This preserves correct chroma subsampling across the resize.
+/// The function unpacks the image into separate Y, U, V planes using
+/// [`kernels::unpack_uyvy_row`], resizes each plane independently using the
+/// specified interpolation mode, then repacks into UYVY using
+/// [`kernels::repack_uyvy_row`]. The unpack and repack kernels dispatch to
+/// NEON (aarch64) or AVX2 (x86_64) SIMD paths where available, falling back
+/// to a scalar implementation otherwise.
 ///
 /// # Arguments
 ///
@@ -287,20 +290,16 @@ pub fn resize_fast_uyvy<A1: ImageAllocator, A2: ImageAllocator>(
     let dst_chroma_w = dst_w / 2;
 
     // --- Unpack UYVY → planar Y, U, V ---
-    let src_slice = src.as_slice();
     let mut y_plane = vec![0u8; src_w * src_h];
     let mut u_plane = vec![0u8; src_chroma_w * src_h];
     let mut v_plane = vec![0u8; src_chroma_w * src_h];
 
     for row in 0..src_h {
-        for col in 0..src_chroma_w {
-            // Each macropixel is 4 bytes: [U, Y0, V, Y1]
-            let i = row * src_w * 2 + col * 4;
-            u_plane[row * src_chroma_w + col]  = src_slice[i];
-            y_plane[row * src_w + col * 2]     = src_slice[i + 1];
-            v_plane[row * src_chroma_w + col]  = src_slice[i + 2];
-            y_plane[row * src_w + col * 2 + 1] = src_slice[i + 3];
-        }
+        let src_row = &src.as_slice()[row * src_w * 2..(row + 1) * src_w * 2];
+        let y_row   = &mut y_plane[row * src_w..][..src_w];
+        let u_row   = &mut u_plane[row * src_chroma_w..][..src_chroma_w];
+        let v_row   = &mut v_plane[row * src_chroma_w..][..src_chroma_w];
+        kernels::unpack_uyvy_row(src_row, y_row, u_row, v_row, src_chroma_w);
     }
 
     // --- Resize each plane independently ---
@@ -332,15 +331,12 @@ pub fn resize_fast_uyvy<A1: ImageAllocator, A2: ImageAllocator>(
     }
 
     // --- Repack planar Y, U, V → UYVY ---
-    let dst_slice = dst.as_slice_mut();
     for row in 0..dst_h {
-        for col in 0..dst_chroma_w {
-            let i = row * dst_w * 2 + col * 4;
-            dst_slice[i]     = u_dst[row * dst_chroma_w + col];
-            dst_slice[i + 1] = y_dst[row * dst_w + col * 2];
-            dst_slice[i + 2] = v_dst[row * dst_chroma_w + col];
-            dst_slice[i + 3] = y_dst[row * dst_w + col * 2 + 1];
-        }
+        let y_row   = &y_dst[row * dst_w..][..dst_w];
+        let u_row   = &u_dst[row * dst_chroma_w..][..dst_chroma_w];
+        let v_row   = &v_dst[row * dst_chroma_w..][..dst_chroma_w];
+        let dst_row = &mut dst.as_slice_mut()[row * dst_w * 2..][..dst_w * 2];
+        kernels::repack_uyvy_row(y_row, u_row, v_row, dst_row, dst_chroma_w);
     }
 
     Ok(())
@@ -802,6 +798,66 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_repack_roundtrip() -> Result<(), ImageError> {
+        // Build a known UYVY pattern
+        let src_w = 32;
+        let src_h = 4;
+        let data: Vec<u8> = (0..src_w * src_h * 2)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let src = Image::<u8, 2, _>::new(
+            ImageSize { width: src_w, height: src_h },
+            data.clone(),
+            CpuAllocator,
+        )?;
+        let mut dst = Image::<u8, 2, _>::from_size_val(
+            ImageSize { width: src_w, height: src_h },
+            0,
+            CpuAllocator,
+        )?;
+
+        // Resize to same size — should be a near-exact roundtrip
+        super::resize_fast_uyvy(&src, &mut dst, super::InterpolationMode::Nearest)?;
+        assert_eq!(src.as_slice(), dst.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn unpack_repack_roundtrip_tail_sizes() -> Result<(), ImageError> {
+        // Widths chosen to exercise both the SIMD bulk loop and the scalar tail:
+        // 6  → AVX2: 1 bulk iter (4 macropixels) + 2 tail; NEON: 0 bulk + 6 tail
+        // 10 → AVX2: 2 bulk iters + 2 tail;               NEON: 0 bulk + 10 tail
+        // 18 → AVX2: 4 bulk iters + 2 tail;               NEON: 1 bulk iter (16) + 2 tail
+        for src_w in [6usize, 10, 18] {
+            let src_h = 4;
+            let data: Vec<u8> = (0..src_w * src_h * 2)
+                .map(|i| (i % 251) as u8)
+                .collect();
+
+            let src = Image::<u8, 2, _>::new(
+                ImageSize { width: src_w, height: src_h },
+                data,
+                CpuAllocator,
+            )?;
+            let mut dst = Image::<u8, 2, _>::from_size_val(
+                ImageSize { width: src_w, height: src_h },
+                0,
+                CpuAllocator,
+            )?;
+
+            super::resize_fast_uyvy(&src, &mut dst, super::InterpolationMode::Nearest)?;
+
+            assert_eq!(
+                src.as_slice(),
+                dst.as_slice(),
+                "roundtrip failed for width {src_w}"
+            );
+        }
         Ok(())
     }
 }

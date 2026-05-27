@@ -1086,3 +1086,182 @@ unsafe fn vertical_row_avx2(rows: &[&[i16]], w: &[i16], dst_row: &mut [u8], n: u
         i += 1;
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// UYVY pack/unpack row kernels.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Unpack one row of packed UYVY into separate Y, U, V planes.
+///
+/// `src` must be `2 * chroma_w * 2` bytes (i.e. `width * 2`).
+/// `y_row` must be `2 * chroma_w` bytes, `u_row`/`v_row` must be `chroma_w` bytes.
+#[inline(always)]
+pub(super) fn unpack_uyvy_row(src: &[u8], y_row: &mut [u8], u_row: &mut [u8], v_row: &mut [u8], chroma_w: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        unpack_uyvy_row_neon(src, y_row, u_row, v_row, chroma_w);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::cpu_features().has_avx2 {
+        unsafe { unpack_uyvy_row_avx2(src, y_row, u_row, v_row, chroma_w) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    unpack_uyvy_row_scalar(src, y_row, u_row, v_row, chroma_w);
+}
+
+/// Repack one row of separate Y, U, V planes into packed UYVY.
+///
+/// `dst` must be `2 * chroma_w * 2` bytes. `y_row` must be `2 * chroma_w` bytes,
+/// `u_row`/`v_row` must be `chroma_w` bytes.
+#[inline(always)]
+pub(super) fn repack_uyvy_row(y_row: &[u8], u_row: &[u8], v_row: &[u8], dst: &mut [u8], chroma_w: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        repack_uyvy_row_neon(y_row, u_row, v_row, dst, chroma_w);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::cpu_features().has_avx2 {
+        unsafe { repack_uyvy_row_avx2(y_row, u_row, v_row, dst, chroma_w) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    repack_uyvy_row_scalar(y_row, u_row, v_row, dst, chroma_w);
+}
+
+#[inline]
+fn unpack_uyvy_row_scalar(src: &[u8], y_row: &mut [u8], u_row: &mut [u8], v_row: &mut [u8], chroma_w: usize) {
+    for col in 0..chroma_w {
+        let i = col * 4;
+        u_row[col]         = src[i];
+        y_row[col * 2]     = src[i + 1];
+        v_row[col]         = src[i + 2];
+        y_row[col * 2 + 1] = src[i + 3];
+    }
+}
+
+#[inline]
+fn repack_uyvy_row_scalar(y_row: &[u8], u_row: &[u8], v_row: &[u8], dst: &mut [u8], chroma_w: usize) {
+    for col in 0..chroma_w {
+        let i = col * 4;
+        dst[i]     = u_row[col];
+        dst[i + 1] = y_row[col * 2];
+        dst[i + 2] = v_row[col];
+        dst[i + 3] = y_row[col * 2 + 1];
+    }
+}
+
+// NEON: vld4q_u8 loads 64 bytes and deinterleaves into 4 × uint8x16_t,
+// mapping [U,Y0,V,Y1,...] directly onto (.0=U, .1=Y0, .2=V, .3=Y1).
+// Process 16 macropixels (64 src bytes → 32 Y + 16 U + 16 V) per iter.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn unpack_uyvy_row_neon(src: &[u8], y_row: &mut [u8], u_row: &mut [u8], v_row: &mut [u8], chroma_w: usize) {
+    use std::arch::aarch64::*;
+    let bulk = chroma_w & !15; // round down to multiple of 16
+    let mut col = 0usize;
+    while col < bulk {
+        // Each vld4q_u8 loads 64 bytes as 4 deinterleaved uint8x16_t registers.
+        // For UYVY: .0 = U, .1 = Y0, .2 = V, .3 = Y1
+        let s = vld4q_u8(src.as_ptr().add(col * 4));
+        // Reinterleave Y: [Y0_0, Y1_0, Y0_1, Y1_1, ...] = vzip
+        let y = vzipq_u8(s.1, s.3);
+        vst1q_u8(y_row.as_mut_ptr().add(col * 2),      y.0);
+        vst1q_u8(y_row.as_mut_ptr().add(col * 2 + 16), y.1);
+        vst1q_u8(u_row.as_mut_ptr().add(col),          s.0);
+        vst1q_u8(v_row.as_mut_ptr().add(col),          s.2);
+        col += 16;
+    }
+    // Scalar tail
+    unpack_uyvy_row_scalar(&src[col * 4..], &mut y_row[col * 2..], &mut u_row[col..], &mut v_row[col..], chroma_w - col);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn repack_uyvy_row_neon(y_row: &[u8], u_row: &[u8], v_row: &[u8], dst: &mut [u8], chroma_w: usize) {
+    use std::arch::aarch64::*;
+    let bulk = chroma_w & !15;
+    let mut col = 0usize;
+    while col < bulk {
+        // Deinterleave Y back into Y0/Y1 pairs via vuzp
+        let y = vld1q_u8_x2(y_row.as_ptr().add(col * 2));
+        let yz = vuzpq_u8(y.0, y.1); // .0 = Y0 lanes, .1 = Y1 lanes
+        let u = vld1q_u8(u_row.as_ptr().add(col));
+        let v = vld1q_u8(v_row.as_ptr().add(col));
+        // vst4q_u8 interleaves 4 registers back to [U, Y0, V, Y1, ...]
+        let s = uint8x16x4_t(u, yz.0, v, yz.1);
+        vst4q_u8(dst.as_mut_ptr().add(col * 4), s);
+        col += 16;
+    }
+    repack_uyvy_row_scalar(&y_row[col * 2..], &u_row[col..], &v_row[col..], &mut dst[col * 4..], chroma_w - col);
+}
+
+// AVX2: _mm256_shuffle_epi8 can deinterleave 32 bytes at a time, but UYVY's
+// 4-byte macropixel stride means we process 128-bit (16 macropixels = 8 chroma
+// pairs) per iter using SSE4.1 shuffles, then widen to AVX2 for throughput.
+// We use two _mm_shuffle_epi8 passes (one for Y, one for UV) per 16-byte chunk.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_uyvy_row_avx2(src: &[u8], y_row: &mut [u8], u_row: &mut [u8], v_row: &mut [u8], chroma_w: usize) {
+    use std::arch::x86_64::*;
+    // Shuffle masks for one 16-byte chunk (4 macropixels = [U0,Y0,V0,Y1, U1,Y2,V1,Y3, ...]):
+    // Y mask:  bytes 1,3,5,7,9,11,13,15 → lanes 0..7, rest -1 (zeroed)
+    // U mask:  bytes 0,4,8,12           → lanes 0..3, rest -1
+    // V mask:  bytes 2,6,10,14          → lanes 0..3, rest -1
+    let y_shuf = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1, 15,13,11,9,7,5,3,1);
+    let u_shuf = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,12,8,4,0);
+    let v_shuf = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,14,10,6,2);
+
+    let bulk = chroma_w & !3; // 4 macropixels per iter
+    let mut col = 0usize;
+    while col < bulk {
+        let s = _mm_loadu_si128(src.as_ptr().add(col * 4) as *const __m128i);
+        let y = _mm_shuffle_epi8(s, y_shuf); // 8 Y bytes in low 8 lanes
+        let u = _mm_shuffle_epi8(s, u_shuf); // 4 U bytes in low 4 lanes
+        let v = _mm_shuffle_epi8(s, v_shuf); // 4 V bytes in low 4 lanes
+        // Store low bytes only
+        std::ptr::copy_nonoverlapping(&_mm_cvtsi128_si64(y) as *const i64 as *const u8, y_row.as_mut_ptr().add(col * 2), 8);
+        std::ptr::copy_nonoverlapping(&_mm_cvtsi128_si32(u) as *const i32 as *const u8, u_row.as_mut_ptr().add(col), 4);
+        std::ptr::copy_nonoverlapping(&_mm_cvtsi128_si32(v) as *const i32 as *const u8, v_row.as_mut_ptr().add(col), 4);
+        col += 4;
+    }
+    unpack_uyvy_row_scalar(&src[col * 4..], &mut y_row[col * 2..], &mut u_row[col..], &mut v_row[col..], chroma_w - col);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn repack_uyvy_row_avx2(y_row: &[u8], u_row: &[u8], v_row: &[u8], dst: &mut [u8], chroma_w: usize) {
+    use std::arch::x86_64::*;
+    // Reverse shuffle: place U, Y0, V, Y1 back into [U0,Y0,V0,Y1,...] pattern.
+    // Load 8 Y bytes + 4 U bytes + 4 V bytes, shuffle into 16-byte UYVY output.
+    // U in lanes 0,4,8,12 | Y0 in lanes 1,5,9,13 | V in lanes 2,6,10,14 | Y1 in lanes 3,7,11,15
+    let bulk = chroma_w & !3;
+    let mut col = 0usize;
+    while col < bulk {
+        // Load components
+        let y_val = _mm_cvtsi64_si128(std::ptr::read_unaligned(y_row.as_ptr().add(col * 2) as *const i64));
+        let u_val = _mm_cvtsi32_si128(std::ptr::read_unaligned(u_row.as_ptr().add(col) as *const i32));
+        let v_val = _mm_cvtsi32_si128(std::ptr::read_unaligned(v_row.as_ptr().add(col) as *const i32));
+
+        // Unpack Y into even/odd: y0 = Y0,Y2,Y4,Y6 in low bytes; y1 = Y1,Y3,Y5,Y7
+        let y_shuf_even = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 6, 4, 2, 0);
+        let y_shuf_odd  = _mm_set_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 7, 5, 3, 1);
+        let y0 = _mm_shuffle_epi8(y_val, y_shuf_even);
+        let y1 = _mm_shuffle_epi8(y_val, y_shuf_odd);
+
+        // Interleave: u_val → lanes 0; y0 → lanes 1; v_val → lanes 2; y1 → lanes 3
+        // UV interleaved: [U0,V0,U1,V1,...] in 8 bytes
+        let uv = _mm_unpacklo_epi8(u_val, v_val);       // [U0,V0,U1,V1,U2,V2,U3,V3,...]
+        let yy = _mm_unpacklo_epi8(y0, y1);             // [Y0,Y1,Y2,Y3,...]
+        // Interleave UV pairs with Y pairs to get UYVY
+        let lo = _mm_unpacklo_epi16(uv, yy);            // [U0,V0,Y0,Y1, U1,V1,Y2,Y3, ...]
+        // Shuffle to [U0,Y0,V0,Y1, U1,Y2,V1,Y3, ...]
+        let out_shuf = _mm_set_epi8(15,13,14,12, 11,9,10,8, 7,5,6,4, 3,1,2,0);
+        let out = _mm_shuffle_epi8(lo, out_shuf);
+        _mm_storeu_si128(dst.as_mut_ptr().add(col * 4) as *mut __m128i, out);
+        col += 4;
+    }
+    repack_uyvy_row_scalar(&y_row[col * 2..], &u_row[col..], &v_row[col..], &mut dst[col * 4..], chroma_w - col);
+}
